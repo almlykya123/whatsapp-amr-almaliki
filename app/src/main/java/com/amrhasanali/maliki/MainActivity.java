@@ -1,9 +1,12 @@
 package com.amrhasanali.maliki;
 
 import android.app.Activity;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -14,71 +17,157 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
-    private static class ChatItem {
-        String title;
-        String lastMessage;
-        String time;
-        boolean isGroup;
-        List<String> messages = new ArrayList<>();
-        List<Boolean> outgoing = new ArrayList<>();
-        List<String> members = new ArrayList<>();
-        List<Boolean> adminFlags = new ArrayList<>();
+    private static final String DB_URL = "https://whatsapp-amr-hasan-default-rtdb.firebaseio.com";
+    private static final String PREFS_NAME = "maliki_whatsapp_prefs";
 
-        ChatItem(String title, String lastMessage, String time, boolean isGroup) {
-            this.title = title;
-            this.lastMessage = lastMessage;
-            this.time = time;
-            this.isGroup = isGroup;
-            if (isGroup) {
-                members.add("أنت");
-                adminFlags.add(false);
-                members.add("شعيب");
-                adminFlags.add(true);
-                members.add("زيد");
-                adminFlags.add(false);
-                members.add("رسام");
-                adminFlags.add(false);
-            }
-            messages.add(lastMessage);
-            outgoing.add(false);
+    private static class MsgItem {
+        String sender;
+        String text;
+        long ts;
+
+        MsgItem(String sender, String text, long ts) {
+            this.sender = sender;
+            this.text = text;
+            this.ts = ts;
         }
     }
 
-    private String userPhone = "";
-    private String sentOtpCode = "";
-    private String activeTab = "chats"; // chats, updates, communities, calls, amr_section
-    private int currentChatIndex = -1;
+    private static class ChatEntry {
+        String id;
+        String title;
+        boolean isGroup;
+        String lastMsg;
+
+        ChatEntry(String id, String title, boolean isGroup, String lastMsg) {
+            this.id = id;
+            this.title = title;
+            this.isGroup = isGroup;
+            this.lastMsg = lastMsg;
+        }
+    }
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Handler pollHandler = new Handler(Looper.getMainLooper());
+
+    private String myPhone = "";
+    private String sentOtp = "";
+    private String activeTab = "chats"; // chats, groups, amr_section
+
+    private boolean isInChatScreen = false;
+    private String currentChatId = "";
+    private String currentChatTitle = "";
+    private boolean currentIsGroup = false;
 
     // خيارات قسم عمرو المليكي
     private boolean takeAdminEnabled = false;
     private boolean autoPullAdminInGroups = false;
     private boolean ghostMode = false;
     private boolean reverseSenders = false;
-    private boolean stealthUpdates = false;
+    private boolean amAdminInCurrentGroup = false;
 
-    private final List<ChatItem> chats = new ArrayList<>();
+    private final List<ChatEntry> chatList = new ArrayList<>();
+    private final List<MsgItem> currentMessages = new ArrayList<>();
+    private final List<String> groupMembers = new ArrayList<>();
+
+    private final Runnable pollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (myPhone != null && !myPhone.isEmpty()) {
+                if (isInChatScreen) {
+                    loadMessages(currentChatId, currentIsGroup, false);
+                } else if ("chats".equals(activeTab) || "groups".equals(activeTab)) {
+                    refreshHomeData();
+                }
+            }
+            pollHandler.postDelayed(this, 3500L);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        seedSampleChats();
-        showPhoneEntryScreen();
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        myPhone = prefs.getString("saved_phone", "");
+        takeAdminEnabled = prefs.getBoolean("take_admin", false);
+        autoPullAdminInGroups = prefs.getBoolean("auto_pull_admin", false);
+        ghostMode = prefs.getBoolean("ghost_mode", false);
+        reverseSenders = prefs.getBoolean("reverse_senders", false);
+
+        if (myPhone != null && !myPhone.isEmpty()) {
+            registerUserOnCloud(myPhone);
+            ensureDefaultGroupsExist();
+            showMainScreen();
+        } else {
+            showPhoneScreen();
+        }
     }
 
-    private void seedSampleChats() {
-        chats.clear();
-        chats.add(new ChatItem("قروب شباب تعز", "يا شباب من المالك الحقيقي للقروب؟", "11:40 م", true));
-        chats.add(new ChatItem("ديوانية المليكي", "تم فتح النقاش الجديد", "10:15 م", true));
-        chats.add(new ChatItem("شعيب عارف", "كيف شغال التطبيق معك؟", "09:50 م", false));
-        chats.add(new ChatItem("رسام قلبي", "أرسلت لك التصميم الجديد", "08:20 م", false));
+    @Override
+    protected void onResume() {
+        super.onResume();
+        pollHandler.removeCallbacks(pollRunnable);
+        pollHandler.postDelayed(pollRunnable, 2500L);
     }
 
-    private void showPhoneEntryScreen() {
+    @Override
+    protected void onPause() {
+        super.onPause();
+        pollHandler.removeCallbacks(pollRunnable);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        executor.shutdownNow();
+    }
+
+    private void savePrefs() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putString("saved_phone", myPhone)
+                .putBoolean("take_admin", takeAdminEnabled)
+                .putBoolean("auto_pull_admin", autoPullAdminInGroups)
+                .putBoolean("ghost_mode", ghostMode)
+                .putBoolean("reverse_senders", reverseSenders)
+                .apply();
+    }
+
+    private String sanitizeKey(String raw) {
+        if (raw == null) return "unknown";
+        return raw.trim().replaceAll("[^0-9A-Za-z_]", "_");
+    }
+
+    private String makeDmId(String p1, String p2) {
+        String a = sanitizeKey(p1);
+        String b = sanitizeKey(p2);
+        if (a.compareTo(b) <= 0) {
+            return "dm_" + a + "__" + b;
+        } else {
+            return "dm_" + b + "__" + a;
+        }
+    }
+
+    private void showPhoneScreen() {
+        isInChatScreen = false;
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setBackgroundColor(Color.parseColor("#0B141A"));
@@ -90,53 +179,52 @@ public class MainActivity extends Activity {
         title.setTextSize(24f);
         title.setTextColor(Color.parseColor("#25D366"));
         title.setGravity(Gravity.CENTER);
-        title.setPadding(0, 0, 0, 12);
+        title.setPadding(0, 0, 0, 10);
 
-        TextView subtitle = new TextView(this);
-        subtitle.setText("أدخل رقم هاتفك لاستلام رمز التحقق");
-        subtitle.setTextSize(14f);
-        subtitle.setTextColor(Color.parseColor("#8696A0"));
-        subtitle.setGravity(Gravity.CENTER);
-        subtitle.setPadding(0, 0, 0, 28);
+        TextView sub = new TextView(this);
+        sub.setText("سجل رقمك للدردشة الحية والقروبات");
+        sub.setTextSize(14f);
+        sub.setTextColor(Color.parseColor("#8696A0"));
+        sub.setGravity(Gravity.CENTER);
+        sub.setPadding(0, 0, 0, 28);
 
         final EditText phoneInput = new EditText(this);
         phoneInput.setText("+967 ");
         phoneInput.setInputType(InputType.TYPE_CLASS_PHONE);
         phoneInput.setTextColor(Color.WHITE);
-        phoneInput.setHintTextColor(Color.parseColor("#8696A0"));
         phoneInput.setBackgroundColor(Color.parseColor("#1F2C34"));
-        phoneInput.setPadding(32, 26, 32, 26);
+        phoneInput.setPadding(30, 24, 30, 24);
 
-        Button sendCodeBtn = new Button(this);
-        sendCodeBtn.setText("إرسال رمز التحقق");
-        sendCodeBtn.setBackgroundColor(Color.parseColor("#00A884"));
-        sendCodeBtn.setTextColor(Color.WHITE);
-        sendCodeBtn.setPadding(24, 26, 24, 26);
+        Button sendBtn = new Button(this);
+        sendBtn.setText("إرسال الكود");
+        sendBtn.setBackgroundColor(Color.parseColor("#00A884"));
+        sendBtn.setTextColor(Color.WHITE);
+        sendBtn.setPadding(24, 24, 24, 24);
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         );
-        lp.setMargins(0, 0, 0, 24);
+        lp.setMargins(0, 0, 0, 22);
 
-        sendCodeBtn.setOnClickListener(new View.OnClickListener() {
+        sendBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 String p = phoneInput.getText().toString().trim();
-                if (p.length() < 7) {
+                if (p.replaceAll("[^0-9]", "").length() < 6) {
                     Toast.makeText(MainActivity.this, "أدخل رقم هاتف صحيح", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                userPhone = p;
-                sentOtpCode = String.valueOf((int) (Math.random() * 9000) + 1000);
-                Toast.makeText(MainActivity.this, "رمز التحقق الخاص بك: " + sentOtpCode, Toast.LENGTH_LONG).show();
+                myPhone = p;
+                sentOtp = String.valueOf((int) (Math.random() * 9000) + 1000);
+                Toast.makeText(MainActivity.this, "كود التحقق: " + sentOtp, Toast.LENGTH_LONG).show();
                 showOtpScreen();
             }
         });
 
         layout.addView(title);
-        layout.addView(subtitle);
+        layout.addView(sub);
         layout.addView(phoneInput, lp);
-        layout.addView(sendCodeBtn, lp);
+        layout.addView(sendBtn, lp);
         setContentView(layout);
     }
 
@@ -148,526 +236,403 @@ public class MainActivity extends Activity {
         layout.setPadding(48, 48, 48, 48);
 
         TextView title = new TextView(this);
-        title.setText("تأكيد الرقم " + userPhone);
+        title.setText("تأكيد الرقم " + myPhone);
         title.setTextSize(20f);
         title.setTextColor(Color.WHITE);
         title.setGravity(Gravity.CENTER);
         title.setPadding(0, 0, 0, 12);
 
-        TextView hint = new TextView(this);
-        hint.setText("تم إرسال الكود التجريبي (" + sentOtpCode + ") — أدخله للمتابعة");
-        hint.setTextSize(13f);
-        hint.setTextColor(Color.parseColor("#25D366"));
-        hint.setGravity(Gravity.CENTER);
-        hint.setPadding(0, 0, 0, 28);
+        TextView info = new TextView(this);
+        info.setText("أدخل رمز التحقق: " + sentOtp);
+        info.setTextSize(14f);
+        info.setTextColor(Color.parseColor("#25D366"));
+        info.setGravity(Gravity.CENTER);
+        info.setPadding(0, 0, 0, 26);
 
         final EditText otpInput = new EditText(this);
-        otpInput.setText(sentOtpCode);
+        otpInput.setText(sentOtp);
         otpInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         otpInput.setTextColor(Color.WHITE);
         otpInput.setBackgroundColor(Color.parseColor("#1F2C34"));
         otpInput.setGravity(Gravity.CENTER);
-        otpInput.setPadding(28, 24, 28, 24);
+        otpInput.setPadding(24, 22, 24, 22);
 
-        Button verifyBtn = new Button(this);
-        verifyBtn.setText("تأكيد والدخول");
-        verifyBtn.setBackgroundColor(Color.parseColor("#00A884"));
-        verifyBtn.setTextColor(Color.WHITE);
-        verifyBtn.setPadding(24, 26, 24, 26);
+        Button okBtn = new Button(this);
+        okBtn.setText("دخول");
+        okBtn.setBackgroundColor(Color.parseColor("#00A884"));
+        okBtn.setTextColor(Color.WHITE);
+        okBtn.setPadding(24, 24, 24, 24);
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         );
-        lp.setMargins(0, 0, 0, 24);
+        lp.setMargins(0, 0, 0, 22);
 
-        verifyBtn.setOnClickListener(new View.OnClickListener() {
+        okBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                String entered = otpInput.getText().toString().trim();
-                if (!entered.equals(sentOtpCode)) {
-                    Toast.makeText(MainActivity.this, "الرمز غير مطابق", Toast.LENGTH_SHORT).show();
+                if (!otpInput.getText().toString().trim().equals(sentOtp)) {
+                    Toast.makeText(MainActivity.this, "الرمز غير صحيح", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                currentChatIndex = -1;
+                savePrefs();
+                registerUserOnCloud(myPhone);
+                ensureDefaultGroupsExist();
                 activeTab = "chats";
-                showMainWhatsAppScreen();
+                showMainScreen();
             }
         });
 
         layout.addView(title);
-        layout.addView(hint);
+        layout.addView(info);
         layout.addView(otpInput, lp);
-        layout.addView(verifyBtn, lp);
+        layout.addView(okBtn, lp);
         setContentView(layout);
     }
 
-    private void showMainWhatsAppScreen() {
+    private void showMainScreen() {
+        isInChatScreen = false;
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.parseColor("#0B141A"));
 
-        // الهيدر العلوي
-        LinearLayout topHeader = new LinearLayout(this);
-        topHeader.setOrientation(LinearLayout.VERTICAL);
-        topHeader.setBackgroundColor(Color.parseColor("#111B21"));
-        topHeader.setPadding(28, 22, 28, 18);
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setBackgroundColor(Color.parseColor("#111B21"));
+        header.setPadding(24, 20, 24, 16);
 
-        TextView appTitle = new TextView(this);
-        String headerName = activeTab.equals("amr_section") ? "قسم عمرو المليكي" : "وتساب عمرو المليكي";
-        appTitle.setText(headerName);
-        appTitle.setTextColor(Color.WHITE);
-        appTitle.setTextSize(20f);
+        TextView hTitle = new TextView(this);
+        String t = "وتساب عمرو المليكي";
+        if ("groups".equals(activeTab)) t = "القروبات";
+        else if ("amr_section".equals(activeTab)) t = "قسم عمرو المليكي";
+        hTitle.setText(t);
+        hTitle.setTextColor(Color.WHITE);
+        hTitle.setTextSize(20f);
 
-        TextView subStatus = new TextView(this);
-        String adminBadge = (takeAdminEnabled || autoPullAdminInGroups) ? "أخذ إشراف: مفعل" : "أخذ إشراف: متوقف";
-        String ghostBadge = ghostMode ? "الشبح: مفعل" : "الشبح: إيقاف";
-        String revBadge = reverseSenders ? "العكس: مفعل" : "العكس: عادي";
-        subStatus.setText(userPhone + "  •  " + adminBadge + "  •  " + ghostBadge + "  •  " + revBadge);
-        subStatus.setTextColor(Color.parseColor("#25D366"));
-        subStatus.setTextSize(11f);
-        subStatus.setPadding(0, 6, 0, 0);
+        TextView hSub = new TextView(this);
+        String st = myPhone
+                + " • " + ((takeAdminEnabled || autoPullAdminInGroups) ? "أخذ إشراف: مفعل" : "أخذ إشراف: متوقف")
+                + " • " + (ghostMode ? "الشبح: مفعل" : "الشبح: إيقاف")
+                + " • " + (reverseSenders ? "العكس: مفعل" : "العكس: عادي");
+        hSub.setText(st);
+        hSub.setTextColor(Color.parseColor("#25D366"));
+        hSub.setTextSize(11f);
+        hSub.setPadding(0, 6, 0, 0);
 
-        topHeader.addView(appTitle);
-        topHeader.addView(subStatus);
+        header.addView(hTitle);
+        header.addView(hSub);
 
-        // المحتوى الأوسط
-        ScrollView bodyScroll = new ScrollView(this);
-        bodyScroll.setPadding(20, 16, 20, 16);
+        ScrollView scroll = new ScrollView(this);
+        scroll.setPadding(18, 14, 18, 14);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(body);
 
-        LinearLayout bodyContainer = new LinearLayout(this);
-        bodyContainer.setOrientation(LinearLayout.VERTICAL);
-        bodyScroll.addView(bodyContainer);
-
-        if (activeTab.equals("chats")) {
-            renderChatsList(bodyContainer);
-        } else if (activeTab.equals("updates")) {
-            renderUpdatesTab(bodyContainer);
-        } else if (activeTab.equals("communities")) {
-            renderCommunitiesTab(bodyContainer);
-        } else if (activeTab.equals("calls")) {
-            renderCallsTab(bodyContainer);
-        } else if (activeTab.equals("amr_section")) {
-            renderAmrSectionTab(bodyContainer);
+        if ("chats".equals(activeTab)) {
+            renderDirectChatsTab(body);
+        } else if ("groups".equals(activeTab)) {
+            renderGroupsTab(body);
+        } else {
+            renderAmrSectionTab(body);
         }
 
-        // الشريط السفلي للتبويبات (مع قسم عمرو المليكي)
-        LinearLayout bottomNav = new LinearLayout(this);
-        bottomNav.setOrientation(LinearLayout.HORIZONTAL);
-        bottomNav.setBackgroundColor(Color.parseColor("#111B21"));
-        bottomNav.setPadding(8, 12, 8, 12);
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        nav.setBackgroundColor(Color.parseColor("#111B21"));
+        nav.setPadding(8, 10, 8, 10);
 
-        bottomNav.addView(makeNavButton("الدردشات", "chats"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        bottomNav.addView(makeNavButton("التحديثات", "updates"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        bottomNav.addView(makeNavButton("المجتمعات", "communities"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        bottomNav.addView(makeNavButton("قسم عمرو", "amr_section"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        nav.addView(makeTabBtn("الدردشات", "chats"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        nav.addView(makeTabBtn("القروبات", "groups"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        nav.addView(makeTabBtn("قسم عمرو", "amr_section"), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-        );
-
-        root.addView(topHeader);
-        root.addView(bodyScroll, bodyParams);
-        root.addView(bottomNav);
+        root.addView(header);
+        root.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        root.addView(nav);
         setContentView(root);
+
+        if ("chats".equals(activeTab) || "groups".equals(activeTab)) {
+            refreshHomeData();
+        }
     }
 
-    private Button makeNavButton(String label, final String targetTab) {
+    private Button makeTabBtn(String label, final String tabId) {
         Button b = new Button(this);
         b.setText(label);
-        b.setTextSize(11f);
-        boolean selected = activeTab.equals(targetTab);
-        b.setBackgroundColor(selected ? Color.parseColor("#005C4B") : Color.parseColor("#111B21"));
-        b.setTextColor(selected ? Color.WHITE : Color.parseColor("#8696A0"));
-        b.setPadding(6, 14, 6, 14);
+        b.setTextSize(12f);
+        boolean sel = activeTab.equals(tabId);
+        b.setBackgroundColor(sel ? Color.parseColor("#005C4B") : Color.parseColor("#111B21"));
+        b.setTextColor(sel ? Color.WHITE : Color.parseColor("#8696A0"));
         b.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                activeTab = targetTab;
-                showMainWhatsAppScreen();
+                activeTab = tabId;
+                showMainScreen();
             }
         });
         return b;
     }
 
-    private void renderChatsList(LinearLayout container) {
-        // زر إنشاء قروب سريع
-        Button newGroupBtn = new Button(this);
-        newGroupBtn.setText("+ إنشاء مجموعة جديدة");
-        newGroupBtn.setBackgroundColor(Color.parseColor("#1F2C34"));
-        newGroupBtn.setTextColor(Color.parseColor("#25D366"));
-        newGroupBtn.setPadding(20, 18, 20, 18);
-        LinearLayout.LayoutParams gParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        );
-        gParams.setMargins(0, 0, 0, 16);
-        newGroupBtn.setOnClickListener(new View.OnClickListener() {
+    private void renderDirectChatsTab(LinearLayout container) {
+        TextView lbl = new TextView(this);
+        lbl.setText("مراسلة أي رقم مسجل أو بدء دردشة جديدة:");
+        lbl.setTextColor(Color.parseColor("#D1D7DB"));
+        lbl.setTextSize(13f);
+        lbl.setPadding(0, 0, 0, 8);
+        container.addView(lbl);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        final EditText targetPhoneInput = new EditText(this);
+        targetPhoneInput.setHint("رقم الطرف الآخر مثل +9677...");
+        targetPhoneInput.setHintTextColor(Color.parseColor("#8696A0"));
+        targetPhoneInput.setInputType(InputType.TYPE_CLASS_PHONE);
+        targetPhoneInput.setTextColor(Color.WHITE);
+        targetPhoneInput.setBackgroundColor(Color.parseColor("#1F2C34"));
+        targetPhoneInput.setPadding(18, 16, 18, 16);
+
+        Button openChatBtn = new Button(this);
+        openChatBtn.setText("فتح الدردشة");
+        openChatBtn.setBackgroundColor(Color.parseColor("#00A884"));
+        openChatBtn.setTextColor(Color.WHITE);
+        openChatBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                int num = chats.size() + 1;
-                ChatItem g = new ChatItem("مجموعة جديدة " + num, "تم إنشاء المجموعة", "الآن", true);
-                if (takeAdminEnabled || autoPullAdminInGroups) {
-                    g.adminFlags.set(0, true);
+                String other = targetPhoneInput.getText().toString().trim();
+                if (other.replaceAll("[^0-9]", "").length() < 6) {
+                    Toast.makeText(MainActivity.this, "أدخل رقم صحيح للمراسلة", Toast.LENGTH_SHORT).show();
+                    return;
                 }
-                chats.add(0, g);
-                showMainWhatsAppScreen();
+                openConversation(makeDmId(myPhone, other), other, false);
             }
         });
-        container.addView(newGroupBtn, gParams);
 
-        for (int i = 0; i < chats.size(); i++) {
-            final int idx = i;
-            final ChatItem item = chats.get(i);
+        row.addView(targetPhoneInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(openChatBtn);
 
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.VERTICAL);
-            row.setBackgroundColor(Color.parseColor("#111B21"));
-            row.setPadding(24, 20, 24, 20);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        rlp.setMargins(0, 0, 0, 16);
+        container.addView(row, rlp);
 
-            String tag = item.isGroup ? " [قروب]" : " [خاص]";
-            TextView nameView = new TextView(this);
-            nameView.setText(item.title + tag + "   •   " + item.time);
-            nameView.setTextColor(Color.WHITE);
-            nameView.setTextSize(16f);
+        TextView usersHeader = new TextView(this);
+        usersHeader.setText("المستخدمون والمحادثات المتاحة:");
+        usersHeader.setTextColor(Color.parseColor("#25D366"));
+        usersHeader.setTextSize(14f);
+        usersHeader.setPadding(0, 0, 0, 10);
+        container.addView(usersHeader);
 
-            TextView msgView = new TextView(this);
-            msgView.setText(item.lastMessage);
-            msgView.setTextColor(Color.parseColor("#8696A0"));
-            msgView.setTextSize(13f);
-            msgView.setPadding(0, 6, 0, 0);
+        if (chatList.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("جاري تحميل المستخدمين من السحابة... إذا لم يظهر أحد بعد، أدخل رقمه في الأعلى وابدأ الدردشة.");
+            empty.setTextColor(Color.parseColor("#8696A0"));
+            empty.setTextSize(13f);
+            container.addView(empty);
+        } else {
+            for (final ChatEntry entry : chatList) {
+                LinearLayout card = new LinearLayout(this);
+                card.setOrientation(LinearLayout.VERTICAL);
+                card.setBackgroundColor(Color.parseColor("#111B21"));
+                card.setPadding(22, 18, 22, 18);
 
-            row.addView(nameView);
-            row.addView(msgView);
+                TextView t = new TextView(this);
+                t.setText(entry.title);
+                t.setTextColor(Color.WHITE);
+                t.setTextSize(16f);
 
-            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            );
-            rp.setMargins(0, 0, 0, 12);
+                TextView s = new TextView(this);
+                s.setText(entry.lastMsg.isEmpty() ? "اضغط لبدء المراسلة" : entry.lastMsg);
+                s.setTextColor(Color.parseColor("#8696A0"));
+                s.setTextSize(12f);
+                s.setPadding(0, 4, 0, 0);
 
-            row.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    currentChatIndex = idx;
-                    if (item.isGroup && autoPullAdminInGroups && !item.adminFlags.isEmpty()) {
-                        item.adminFlags.set(0, true);
+                card.addView(t);
+                card.addView(s);
+
+                LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                );
+                clp.setMargins(0, 0, 0, 10);
+                card.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        openConversation(entry.id, entry.title, false);
                     }
-                    showSingleChatScreen();
-                }
-            });
-
-            container.addView(row, rp);
+                });
+                container.addView(card, clp);
+            }
         }
     }
 
-    private void showSingleChatScreen() {
-        final ChatItem chat = chats.get(currentChatIndex);
+    private void renderGroupsTab(LinearLayout container) {
+        LinearLayout createRow = new LinearLayout(this);
+        createRow.setOrientation(LinearLayout.HORIZONTAL);
+        createRow.setGravity(Gravity.CENTER_VERTICAL);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#0B141A"));
+        final EditText groupNameInput = new EditText(this);
+        groupNameInput.setHint("اسم قروب جديد...");
+        groupNameInput.setHintTextColor(Color.parseColor("#8696A0"));
+        groupNameInput.setTextColor(Color.WHITE);
+        groupNameInput.setBackgroundColor(Color.parseColor("#1F2C34"));
+        groupNameInput.setPadding(18, 16, 18, 16);
 
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.VERTICAL);
-        bar.setBackgroundColor(Color.parseColor("#111B21"));
-        bar.setPadding(20, 18, 20, 18);
-
-        LinearLayout topLine = new LinearLayout(this);
-        topLine.setOrientation(LinearLayout.HORIZONTAL);
-        topLine.setGravity(Gravity.CENTER_VERTICAL);
-
-        Button backBtn = new Button(this);
-        backBtn.setText("رجوع");
-        backBtn.setTextSize(12f);
-        backBtn.setBackgroundColor(Color.parseColor("#1F2C34"));
-        backBtn.setTextColor(Color.WHITE);
-        backBtn.setOnClickListener(new View.OnClickListener() {
+        Button createGroupBtn = new Button(this);
+        createGroupBtn.setText("+ إنشاء قروب");
+        createGroupBtn.setBackgroundColor(Color.parseColor("#00A884"));
+        createGroupBtn.setTextColor(Color.WHITE);
+        createGroupBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                currentChatIndex = -1;
-                showMainWhatsAppScreen();
+                String gName = groupNameInput.getText().toString().trim();
+                if (gName.isEmpty()) gName = "قروب عمرو المليكي";
+                createGroupOnCloud(gName);
+                groupNameInput.setText("");
             }
         });
 
-        TextView titleView = new TextView(this);
-        boolean amAdminNow = !chat.adminFlags.isEmpty() && chat.adminFlags.get(0);
-        String roleText = chat.isGroup ? (amAdminNow ? " (مشرف)" : " (عضو)") : (ghostMode ? " (وضع الشبح)" : " (متصل)");
-        titleView.setText("  " + chat.title + roleText);
-        titleView.setTextColor(Color.WHITE);
-        titleView.setTextSize(16f);
+        createRow.addView(groupNameInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        createRow.addView(createGroupBtn);
 
-        topLine.addView(backBtn);
-        topLine.addView(titleView);
-        bar.addView(topLine);
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        glp.setMargins(0, 0, 0, 16);
+        container.addView(createRow, glp);
 
-        // أزرار سريعة داخل المحادثة (أخذ إشراف / عكس / شبح)
-        LinearLayout quickRow = new LinearLayout(this);
-        quickRow.setOrientation(LinearLayout.HORIZONTAL);
-        quickRow.setPadding(0, 12, 0, 0);
+        TextView gHeader = new TextView(this);
+        gHeader.setText("القروبات النشطة (الدردشة جماعية ومباشرة):");
+        gHeader.setTextColor(Color.parseColor("#25D366"));
+        gHeader.setTextSize(14f);
+        gHeader.setPadding(0, 0, 0, 10);
+        container.addView(gHeader);
 
-        Button revQuick = new Button(this);
-        revQuick.setText(reverseSenders ? "العكس: مفعل" : "عكس الرسائل");
-        revQuick.setTextSize(11f);
-        revQuick.setBackgroundColor(reverseSenders ? Color.parseColor("#D97706") : Color.parseColor("#1F2C34"));
-        revQuick.setTextColor(Color.WHITE);
-        revQuick.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                reverseSenders = !reverseSenders;
-                showSingleChatScreen();
-            }
-        });
+        if (chatList.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("جاري تحميل القروبات...");
+            empty.setTextColor(Color.parseColor("#8696A0"));
+            container.addView(empty);
+        } else {
+            for (final ChatEntry g : chatList) {
+                LinearLayout card = new LinearLayout(this);
+                card.setOrientation(LinearLayout.VERTICAL);
+                card.setBackgroundColor(Color.parseColor("#111B21"));
+                card.setPadding(22, 18, 22, 18);
 
-        Button ghostQuick = new Button(this);
-        ghostQuick.setText(ghostMode ? "الشبح: مفعل" : "وضع الشبح");
-        ghostQuick.setTextSize(11f);
-        ghostQuick.setBackgroundColor(ghostMode ? Color.parseColor("#00A884") : Color.parseColor("#1F2C34"));
-        ghostQuick.setTextColor(Color.WHITE);
-        ghostQuick.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                ghostMode = !ghostMode;
-                showSingleChatScreen();
-            }
-        });
+                TextView t = new TextView(this);
+                t.setText(g.title + " [قروب]");
+                t.setTextColor(Color.WHITE);
+                t.setTextSize(16f);
 
-        quickRow.addView(revQuick, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        quickRow.addView(ghostQuick, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                TextView s = new TextView(this);
+                s.setText(g.lastMsg.isEmpty() ? "اضغط للدخول ومشاهدة رسائل القروب" : g.lastMsg);
+                s.setTextColor(Color.parseColor("#8696A0"));
+                s.setTextSize(12f);
+                s.setPadding(0, 4, 0, 0);
 
-        if (chat.isGroup) {
-            Button pullAdminQuick = new Button(this);
-            pullAdminQuick.setText("أخذ إشراف");
-            pullAdminQuick.setTextSize(11f);
-            pullAdminQuick.setBackgroundColor(Color.parseColor("#0284C7"));
-            pullAdminQuick.setTextColor(Color.WHITE);
-            pullAdminQuick.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    if (!chat.adminFlags.isEmpty()) {
-                        chat.adminFlags.set(0, true);
-                    }
-                    chat.messages.add("تم تفعيل إشرافك في المجموعة عبر قسم أخذ الإشراف");
-                    chat.outgoing.add(false);
-                    showSingleChatScreen();
-                }
-            });
-            quickRow.addView(pullAdminQuick, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        }
+                card.addView(t);
+                card.addView(s);
 
-        bar.addView(quickRow);
-
-        // قائمة الأعضاء إذا كانت مجموعة
-        ScrollView msgScroll = new ScrollView(this);
-        msgScroll.setPadding(20, 16, 20, 16);
-
-        LinearLayout msgBox = new LinearLayout(this);
-        msgBox.setOrientation(LinearLayout.VERTICAL);
-        msgScroll.addView(msgBox);
-
-        if (chat.isGroup && !chat.members.isEmpty()) {
-            boolean canManage = !chat.adminFlags.isEmpty() && chat.adminFlags.get(0);
-            for (int i = 0; i < chat.members.size(); i++) {
-                final int mIdx = i;
-                String mName = chat.members.get(i);
-                boolean mAdmin = chat.adminFlags.get(i);
-
-                LinearLayout mRow = new LinearLayout(this);
-                mRow.setOrientation(LinearLayout.HORIZONTAL);
-                mRow.setGravity(Gravity.CENTER_VERTICAL);
-                mRow.setBackgroundColor(Color.parseColor("#111B21"));
-                mRow.setPadding(16, 10, 16, 10);
-
-                TextView mTv = new TextView(this);
-                mTv.setText(mName + (mAdmin ? " [مشرف]" : " [عضو]"));
-                mTv.setTextColor(Color.WHITE);
-                mTv.setTextSize(12f);
-                mRow.addView(mTv, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-                if (canManage && mIdx > 0) {
-                    Button kick = new Button(this);
-                    kick.setText("إخراج");
-                    kick.setTextSize(10f);
-                    kick.setBackgroundColor(Color.parseColor("#DC2626"));
-                    kick.setTextColor(Color.WHITE);
-                    kick.setOnClickListener(new View.OnClickListener() {
-                        @Override
-                        public void onClick(View v) {
-                            String removed = chat.members.remove(mIdx);
-                            chat.adminFlags.remove(mIdx);
-                            chat.messages.add("تم إخراج " + removed + " من المجموعة");
-                            chat.outgoing.add(false);
-                            showSingleChatScreen();
-                        }
-                    });
-                    mRow.addView(kick);
-                }
-
-                LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
                 );
-                mp.setMargins(0, 0, 0, 6);
-                msgBox.addView(mRow, mp);
+                clp.setMargins(0, 0, 0, 10);
+                card.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        openConversation(g.id, g.title, true);
+                    }
+                });
+                container.addView(card, clp);
             }
         }
-
-        // عرض الرسائل مع دعم زر العكس ووضع الشبح
-        for (int i = 0; i < chat.messages.size(); i++) {
-            String txt = chat.messages.get(i);
-            boolean out = chat.outgoing.get(i);
-            if (reverseSenders) {
-                out = !out;
-            }
-
-            TextView bubble = new TextView(this);
-            String mark = ghostMode ? "" : (out ? " ✓✓" : "");
-            bubble.setText(txt + mark);
-            bubble.setTextColor(Color.WHITE);
-            bubble.setTextSize(15f);
-            bubble.setPadding(24, 16, 24, 16);
-
-            GradientDrawable bg = new GradientDrawable();
-            bg.setCornerRadius(22f);
-            bg.setColor(out ? Color.parseColor("#005C4B") : Color.parseColor("#202C33"));
-            bubble.setBackground(bg);
-
-            LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            );
-            bp.gravity = out ? Gravity.END : Gravity.START;
-            bp.setMargins(0, 0, 0, 12);
-            msgBox.addView(bubble, bp);
-        }
-
-        // شريط الإرسال
-        LinearLayout sendBar = new LinearLayout(this);
-        sendBar.setOrientation(LinearLayout.HORIZONTAL);
-        sendBar.setBackgroundColor(Color.parseColor("#111B21"));
-        sendBar.setPadding(16, 12, 16, 12);
-        sendBar.setGravity(Gravity.CENTER_VERTICAL);
-
-        final EditText input = new EditText(this);
-        input.setHint("رسالة");
-        input.setHintTextColor(Color.parseColor("#8696A0"));
-        input.setTextColor(Color.WHITE);
-        input.setBackgroundColor(Color.parseColor("#1F2C34"));
-        input.setPadding(22, 18, 22, 18);
-
-        Button sendBtn = new Button(this);
-        sendBtn.setText("إرسال");
-        sendBtn.setBackgroundColor(Color.parseColor("#00A884"));
-        sendBtn.setTextColor(Color.WHITE);
-        sendBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                String t = input.getText().toString().trim();
-                if (t.isEmpty()) return;
-                chat.messages.add(t);
-                chat.outgoing.add(true);
-                chat.lastMessage = t;
-                input.setText("");
-                showSingleChatScreen();
-            }
-        });
-
-        sendBar.addView(input, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        sendBar.addView(sendBtn);
-
-        root.addView(bar);
-        root.addView(msgScroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-        root.addView(sendBar);
-        setContentView(root);
     }
 
     private void renderAmrSectionTab(LinearLayout container) {
-        TextView secHeader = new TextView(this);
-        secHeader.setText("قسم عمرو المليكي — الأقسام وخيارات التفعيل");
-        secHeader.setTextColor(Color.parseColor("#25D366"));
-        secHeader.setTextSize(16f);
-        secHeader.setPadding(0, 0, 0, 14);
-        container.addView(secHeader);
+        TextView head = new TextView(this);
+        head.setText("قسم عمرو المليكي — التحكم والأقسام");
+        head.setTextColor(Color.parseColor("#25D366"));
+        head.setTextSize(16f);
+        head.setPadding(0, 0, 0, 14);
+        container.addView(head);
 
-        // 1. قسم أخذ إشراف
-        container.addView(makeSectionCard(
+        container.addView(makeSwitchCard(
                 "قسم أخذ إشراف",
-                "تفعيل صلاحية أخذ الإشراف وترقية نفسك مشرفاً في القروبات",
-                takeAdminEnabled ? "مفعل" : "متوقف",
+                "تفعيل صلاحية أخذ الإشراف وترقيتك مشرفاً في القروبات",
+                takeAdminEnabled,
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         takeAdminEnabled = !takeAdminEnabled;
-                        for (ChatItem c : chats) {
-                            if (c.isGroup && !c.adminFlags.isEmpty()) {
-                                c.adminFlags.set(0, takeAdminEnabled);
-                            }
-                        }
-                        Toast.makeText(MainActivity.this,
-                                takeAdminEnabled ? "تم تفعيل قسم أخذ الإشراف" : "تم إيقاف قسم أخذ الإشراف",
-                                Toast.LENGTH_SHORT).show();
-                        showMainWhatsAppScreen();
+                        savePrefs();
+                        showMainScreen();
                     }
                 }
         ));
 
-        // 2. قسم سحب الإشراف التلقائي عند دخول القروبات
-        container.addView(makeSectionCard(
-                "قسم سحب الإشراف عند الدخول",
-                "جعل صلاحية المشرف مفعّلة تلقائياً عند فتح أي مجموعة",
-                autoPullAdminInGroups ? "مفعل" : "متوقف",
+        container.addView(makeSwitchCard(
+                "قسم أخذ إشراف تلقائي عند دخول القروب",
+                "تفعيل إشرافك تلقائياً بمجرد فتح أي قروب",
+                autoPullAdminInGroups,
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         autoPullAdminInGroups = !autoPullAdminInGroups;
-                        showMainWhatsAppScreen();
+                        savePrefs();
+                        showMainScreen();
                     }
                 }
         ));
 
-        // 3. قسم عكس الرسائل
-        container.addView(makeSectionCard(
+        container.addView(makeSwitchCard(
                 "قسم عكس الرسائل",
-                "عكس اتجاه الرسائل لتظهر وكأنها من الطرف الآخر والعكس",
-                reverseSenders ? "مفعل" : "متوقف",
+                "عكس اتجاه عرض الرسائل داخل المحادثات",
+                reverseSenders,
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         reverseSenders = !reverseSenders;
-                        showMainWhatsAppScreen();
+                        savePrefs();
+                        showMainScreen();
                     }
                 }
         ));
 
-        // 4. قسم وضع الشبح
-        container.addView(makeSectionCard(
+        container.addView(makeSwitchCard(
                 "قسم وضع الشبح",
-                "إخفاء حالة الاتصال وإيقاف علامات القراءة",
-                ghostMode ? "مفعل" : "متوقف",
+                "إخفاء حالة الاتصال وعلامات القراءة",
+                ghostMode,
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         ghostMode = !ghostMode;
-                        showMainWhatsAppScreen();
+                        savePrefs();
+                        showMainScreen();
                     }
                 }
         ));
 
-        // 5. قسم الحالات والقنوات المخفية
-        container.addView(makeSectionCard(
-                "قسم مشاهدة الحالات بصمت",
-                "تصفح التحديثات والحالات بدون إظهار المشاهدة",
-                stealthUpdates ? "مفعل" : "متوقف",
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        stealthUpdates = !stealthUpdates;
-                        showMainWhatsAppScreen();
-                    }
-                }
-        ));
+        Button logoutBtn = new Button(this);
+        logoutBtn.setText("تبديل الرقم / تسجيل خروج");
+        logoutBtn.setBackgroundColor(Color.parseColor("#7F1D1D"));
+        logoutBtn.setTextColor(Color.WHITE);
+        logoutBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                myPhone = "";
+                savePrefs();
+                showPhoneScreen();
+            }
+        });
+        container.addView(logoutBtn);
     }
 
-    private LinearLayout makeSectionCard(String title, String desc, String stateText, View.OnClickListener toggleListener) {
+    private LinearLayout makeSwitchCard(String title, String desc, boolean enabled, View.OnClickListener listener) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setBackgroundColor(Color.parseColor("#111B21"));
-        card.setPadding(24, 20, 24, 20);
+        card.setPadding(22, 18, 22, 18);
 
         TextView t = new TextView(this);
         t.setText(title);
@@ -678,15 +643,14 @@ public class MainActivity extends Activity {
         d.setText(desc);
         d.setTextColor(Color.parseColor("#8696A0"));
         d.setTextSize(12f);
-        d.setPadding(0, 6, 0, 12);
+        d.setPadding(0, 4, 0, 12);
 
         Button btn = new Button(this);
-        btn.setText("الحالة: " + stateText + " (اضغط للتبديل)");
+        btn.setText("الحالة: " + (enabled ? "مفعل" : "متوقف") + " (اضغط للتبديل)");
         btn.setTextSize(12f);
-        boolean active = stateText.equals("مفعل");
-        btn.setBackgroundColor(active ? Color.parseColor("#00A884") : Color.parseColor("#1F2C34"));
+        btn.setBackgroundColor(enabled ? Color.parseColor("#00A884") : Color.parseColor("#1F2C34"));
         btn.setTextColor(Color.WHITE);
-        btn.setOnClickListener(toggleListener);
+        btn.setOnClickListener(listener);
 
         card.addView(t);
         card.addView(d);
@@ -695,55 +659,475 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         );
-        lp.setMargins(0, 0, 0, 14);
+        lp.setMargins(0, 0, 0, 12);
         card.setLayoutParams(lp);
         return card;
     }
 
-    private void renderUpdatesTab(LinearLayout container) {
-        TextView tv = new TextView(this);
-        tv.setText("التحديثات والحالات" + (stealthUpdates ? " (مشاهدة صامتة مفعلة)" : ""));
-        tv.setTextColor(Color.WHITE);
-        tv.setTextSize(16f);
-        tv.setPadding(0, 0, 0, 12);
-        container.addView(tv);
+    private void openConversation(String chatId, String title, boolean isGroup) {
+        isInChatScreen = true;
+        currentChatId = chatId;
+        currentChatTitle = title;
+        currentIsGroup = isGroup;
+        amAdminInCurrentGroup = isGroup && (takeAdminEnabled || autoPullAdminInGroups);
+        renderConversationScreen();
+        loadMessages(currentChatId, currentIsGroup, true);
+    }
 
-        String[] statuses = {"حالة عمرو المليكي — الآن", "حالة شعيب — قبل 25 دقيقة", "حالة زيد — قبل ساعة"};
-        for (String s : statuses) {
-            TextView item = new TextView(this);
-            item.setText(s);
-            item.setTextColor(Color.parseColor("#D1D7DB"));
-            item.setBackgroundColor(Color.parseColor("#111B21"));
-            item.setPadding(24, 20, 24, 20);
-            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            );
-            p.setMargins(0, 0, 0, 10);
-            container.addView(item, p);
+    private void renderConversationScreen() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.parseColor("#0B141A"));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.VERTICAL);
+        top.setBackgroundColor(Color.parseColor("#111B21"));
+        top.setPadding(18, 16, 18, 14);
+
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.setGravity(Gravity.CENTER_VERTICAL);
+
+        Button backBtn = new Button(this);
+        backBtn.setText("رجوع");
+        backBtn.setTextSize(12f);
+        backBtn.setBackgroundColor(Color.parseColor("#1F2C34"));
+        backBtn.setTextColor(Color.WHITE);
+        backBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                isInChatScreen = false;
+                showMainScreen();
+            }
+        });
+
+        TextView titleTv = new TextView(this);
+        String roleTag = currentIsGroup ? (amAdminInCurrentGroup ? " [مشرف]" : " [عضو]") : "";
+        titleTv.setText("  " + currentChatTitle + roleTag);
+        titleTv.setTextColor(Color.WHITE);
+        titleTv.setTextSize(15f);
+
+        row1.addView(backBtn);
+        row1.addView(titleTv);
+        top.addView(row1);
+
+        LinearLayout toolsRow = new LinearLayout(this);
+        toolsRow.setOrientation(LinearLayout.HORIZONTAL);
+        toolsRow.setPadding(0, 10, 0, 0);
+
+        Button revBtn = new Button(this);
+        revBtn.setText(reverseSenders ? "العكس: مفعل" : "عكس");
+        revBtn.setTextSize(11f);
+        revBtn.setBackgroundColor(reverseSenders ? Color.parseColor("#D97706") : Color.parseColor("#1F2C34"));
+        revBtn.setTextColor(Color.WHITE);
+        revBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                reverseSenders = !reverseSenders;
+                savePrefs();
+                renderConversationScreen();
+            }
+        });
+
+        Button ghostBtn = new Button(this);
+        ghostBtn.setText(ghostMode ? "الشبح: مفعل" : "الشبح");
+        ghostBtn.setTextSize(11f);
+        ghostBtn.setBackgroundColor(ghostMode ? Color.parseColor("#00A884") : Color.parseColor("#1F2C34"));
+        ghostBtn.setTextColor(Color.WHITE);
+        ghostBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                ghostMode = !ghostMode;
+                savePrefs();
+                renderConversationScreen();
+            }
+        });
+
+        toolsRow.addView(revBtn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        toolsRow.addView(ghostBtn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (currentIsGroup) {
+            Button adminBtn = new Button(this);
+            adminBtn.setText("أخذ إشراف");
+            adminBtn.setTextSize(11f);
+            adminBtn.setBackgroundColor(Color.parseColor("#0284C7"));
+            adminBtn.setTextColor(Color.WHITE);
+            adminBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    amAdminInCurrentGroup = true;
+                    takeAdminEnabled = true;
+                    savePrefs();
+                    Toast.makeText(MainActivity.this, "تم أخذ الإشراف في القروب", Toast.LENGTH_SHORT).show();
+                    renderConversationScreen();
+                }
+            });
+            toolsRow.addView(adminBtn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         }
+
+        top.addView(toolsRow);
+
+        ScrollView msgScroll = new ScrollView(this);
+        msgScroll.setPadding(18, 14, 18, 14);
+        LinearLayout msgBox = new LinearLayout(this);
+        msgBox.setOrientation(LinearLayout.VERTICAL);
+        msgScroll.addView(msgBox);
+
+        if (currentIsGroup && !groupMembers.isEmpty()) {
+            TextView mHeader = new TextView(this);
+            mHeader.setText("أعضاء القروب (" + groupMembers.size() + "):");
+            mHeader.setTextColor(Color.parseColor("#25D366"));
+            mHeader.setTextSize(12f);
+            mHeader.setPadding(0, 0, 0, 6);
+            msgBox.addView(mHeader);
+
+            for (int i = 0; i < groupMembers.size(); i++) {
+                final String member = groupMembers.get(i);
+                LinearLayout mRow = new LinearLayout(this);
+                mRow.setOrientation(LinearLayout.HORIZONTAL);
+                mRow.setGravity(Gravity.CENTER_VERTICAL);
+                mRow.setBackgroundColor(Color.parseColor("#111B21"));
+                mRow.setPadding(14, 8, 14, 8);
+
+                TextView mTv = new TextView(this);
+                mTv.setText(member + (member.equals(myPhone) && amAdminInCurrentGroup ? " [مشرف]" : ""));
+                mTv.setTextColor(Color.WHITE);
+                mTv.setTextSize(12f);
+                mRow.addView(mTv, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                if (amAdminInCurrentGroup && !member.equals(myPhone)) {
+                    Button kickBtn = new Button(this);
+                    kickBtn.setText("إخراج");
+                    kickBtn.setTextSize(10f);
+                    kickBtn.setBackgroundColor(Color.parseColor("#DC2626"));
+                    kickBtn.setTextColor(Color.WHITE);
+                    kickBtn.setOnClickListener(new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            groupMembers.remove(member);
+                            sendMessageToCloud(currentChatId, true, "تم إخراج " + member + " من القروب");
+                        }
+                    });
+                    mRow.addView(kickBtn);
+                }
+
+                LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                );
+                mlp.setMargins(0, 0, 0, 6);
+                msgBox.addView(mRow, mlp);
+            }
+        }
+
+        if (currentMessages.isEmpty()) {
+            TextView noMsg = new TextView(this);
+            noMsg.setText("لا توجد رسائل بعد. ابدأ المراسلة الآن!");
+            noMsg.setTextColor(Color.parseColor("#8696A0"));
+            noMsg.setGravity(Gravity.CENTER);
+            noMsg.setPadding(0, 32, 0, 0);
+            msgBox.addView(noMsg);
+        } else {
+            for (MsgItem m : currentMessages) {
+                boolean mine = m.sender.equals(myPhone);
+                if (reverseSenders) {
+                    mine = !mine;
+                }
+
+                TextView bubble = new TextView(this);
+                String prefix = currentIsGroup ? (m.sender + ":\n") : "";
+                String suffix = ghostMode ? "" : (mine ? "  ✓✓" : "");
+                bubble.setText(prefix + m.text + suffix);
+                bubble.setTextColor(Color.WHITE);
+                bubble.setTextSize(14f);
+                bubble.setPadding(22, 14, 22, 14);
+
+                GradientDrawable bg = new GradientDrawable();
+                bg.setCornerRadius(20f);
+                bg.setColor(mine ? Color.parseColor("#005C4B") : Color.parseColor("#202C33"));
+                bubble.setBackground(bg);
+
+                LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                );
+                blp.gravity = mine ? Gravity.END : Gravity.START;
+                blp.setMargins(0, 0, 0, 10);
+                msgBox.addView(bubble, blp);
+            }
+        }
+
+        LinearLayout bottomInput = new LinearLayout(this);
+        bottomInput.setOrientation(LinearLayout.HORIZONTAL);
+        bottomInput.setBackgroundColor(Color.parseColor("#111B21"));
+        bottomInput.setPadding(14, 10, 14, 10);
+        bottomInput.setGravity(Gravity.CENTER_VERTICAL);
+
+        final EditText msgField = new EditText(this);
+        msgField.setHint("اكتب رسالة...");
+        msgField.setHintTextColor(Color.parseColor("#8696A0"));
+        msgField.setTextColor(Color.WHITE);
+        msgField.setBackgroundColor(Color.parseColor("#1F2C34"));
+        msgField.setPadding(20, 16, 20, 16);
+
+        Button sendBtn = new Button(this);
+        sendBtn.setText("إرسال");
+        sendBtn.setBackgroundColor(Color.parseColor("#00A884"));
+        sendBtn.setTextColor(Color.WHITE);
+        sendBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String txt = msgField.getText().toString().trim();
+                if (txt.isEmpty()) return;
+                msgField.setText("");
+                sendMessageToCloud(currentChatId, currentIsGroup, txt);
+            }
+        });
+
+        bottomInput.addView(msgField, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        bottomInput.addView(sendBtn);
+
+        root.addView(top);
+        root.addView(msgScroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        root.addView(bottomInput);
+        setContentView(root);
     }
 
-    private void renderCommunitiesTab(LinearLayout container) {
-        TextView tv = new TextView(this);
-        tv.setText("المجتمعات");
-        tv.setTextColor(Color.WHITE);
-        tv.setTextSize(16f);
-        tv.setPadding(0, 0, 0, 12);
-        container.addView(tv);
-
-        TextView c1 = new TextView(this);
-        c1.setText("مجتمع المطورين والمبرمجين — يشمل المجموعات والإعلانات");
-        c1.setTextColor(Color.parseColor("#D1D7DB"));
-        c1.setBackgroundColor(Color.parseColor("#111B21"));
-        c1.setPadding(24, 22, 24, 22);
-        container.addView(c1);
+    private void registerUserOnCloud(final String phone) {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String key = sanitizeKey(phone);
+                    JSONObject obj = new JSONObject();
+                    obj.put("phone", phone);
+                    obj.put("lastSeen", ghostMode ? "شبح" : "متصل");
+                    obj.put("updatedAt", System.currentTimeMillis());
+                    httpPut(DB_URL + "/users/" + key + ".json", obj.toString());
+                } catch (Exception ignored) {
+                }
+            }
+        });
     }
 
-    private void renderCallsTab(LinearLayout container) {
-        TextView tv = new TextView(this);
-        tv.setText("المكالمات");
-        tv.setTextColor(Color.WHITE);
-        tv.setTextSize(16f);
-        container.addView(tv);
+    private void ensureDefaultGroupsExist() {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String existing = httpGet(DB_URL + "/groups/general_maliki.json");
+                    if (existing == null || existing.equals("null") || existing.trim().isEmpty()) {
+                        JSONObject g = new JSONObject();
+                        g.put("name", "قروب عمرو المليكي العام");
+                        g.put("lastMsg", "مرحباً بكم في قروب عمرو المليكي");
+                        g.put("updatedAt", System.currentTimeMillis());
+                        httpPut(DB_URL + "/groups/general_maliki.json", g.toString());
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
+    private void createGroupOnCloud(final String groupName) {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String id = "grp_" + System.currentTimeMillis();
+                    JSONObject g = new JSONObject();
+                    g.put("name", groupName);
+                    g.put("creator", myPhone);
+                    g.put("lastMsg", "تم إنشاء القروب بواسطة " + myPhone);
+                    g.put("updatedAt", System.currentTimeMillis());
+                    httpPut(DB_URL + "/groups/" + id + ".json", g.toString());
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            Toast.makeText(MainActivity.this, "تم إنشاء القروب: " + groupName, Toast.LENGTH_SHORT).show();
+                            refreshHomeData();
+                        }
+                    });
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
+    private void refreshHomeData() {
+        final String mode = activeTab;
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                final List<ChatEntry> fetched = new ArrayList<>();
+                try {
+                    if ("chats".equals(mode)) {
+                        String rawUsers = httpGet(DB_URL + "/users.json");
+                        if (rawUsers != null && !rawUsers.equals("null")) {
+                            JSONObject usersObj = new JSONObject(rawUsers);
+                            Iterator<String> keys = usersObj.keys();
+                            while (keys.hasNext()) {
+                                String k = keys.next();
+                                JSONObject u = usersObj.optJSONObject(k);
+                                if (u != null) {
+                                    String p = u.optString("phone", k);
+                                    if (!p.equals(myPhone)) {
+                                        fetched.add(new ChatEntry(makeDmId(myPhone, p), p, false, "اضغط للمراسلة المباشرة"));
+                                    }
+                                }
+                            }
+                        }
+                    } else if ("groups".equals(mode)) {
+                        String rawGroups = httpGet(DB_URL + "/groups.json");
+                        if (rawGroups != null && !rawGroups.equals("null")) {
+                            JSONObject gObj = new JSONObject(rawGroups);
+                            Iterator<String> keys = gObj.keys();
+                            while (keys.hasNext()) {
+                                String k = keys.next();
+                                JSONObject item = gObj.optJSONObject(k);
+                                if (item != null) {
+                                    String name = item.optString("name", k);
+                                    String last = item.optString("lastMsg", "");
+                                    fetched.add(new ChatEntry(k, name, true, last));
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!isInChatScreen && activeTab.equals(mode)) {
+                            chatList.clear();
+                            chatList.addAll(fetched);
+                            showMainScreen();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private void loadMessages(final String chatId, final boolean isGroup, final boolean forceRedraw) {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                final List<MsgItem> loaded = new ArrayList<>();
+                final List<String> members = new ArrayList<>();
+                try {
+                    String path = isGroup ? ("/groups/" + chatId + "/messages.json") : ("/chats/" + chatId + "/messages.json");
+                    String raw = httpGet(DB_URL + path);
+                    if (raw != null && !raw.equals("null")) {
+                        JSONObject map = new JSONObject(raw);
+                        Iterator<String> keys = map.keys();
+                        while (keys.hasNext()) {
+                            JSONObject m = map.optJSONObject(keys.next());
+                            if (m != null) {
+                                String sender = m.optString("sender", "مستخدم");
+                                String text = m.optString("text", "");
+                                long ts = m.optLong("ts", 0L);
+                                loaded.add(new MsgItem(sender, text, ts));
+                                if (!members.contains(sender)) {
+                                    members.add(sender);
+                                }
+                            }
+                        }
+                    }
+                    if (!members.contains(myPhone)) {
+                        members.add(0, myPhone);
+                    }
+                } catch (Exception ignored) {
+                }
+
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isInChatScreen && currentChatId.equals(chatId)) {
+                            boolean changed = forceRedraw || (loaded.size() != currentMessages.size());
+                            currentMessages.clear();
+                            currentMessages.addAll(loaded);
+                            groupMembers.clear();
+                            groupMembers.addAll(members);
+                            if (changed) {
+                                renderConversationScreen();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private void sendMessageToCloud(final String chatId, final boolean isGroup, final String text) {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    long now = System.currentTimeMillis();
+                    JSONObject msg = new JSONObject();
+                    msg.put("sender", myPhone);
+                    msg.put("text", text);
+                    msg.put("ts", now);
+
+                    String msgPath = isGroup
+                            ? (DB_URL + "/groups/" + chatId + "/messages.json")
+                            : (DB_URL + "/chats/" + chatId + "/messages.json");
+                    httpPost(msgPath, msg.toString());
+
+                    if (isGroup) {
+                        JSONObject meta = new JSONObject();
+                        meta.put("lastMsg", myPhone + ": " + text);
+                        meta.put("updatedAt", now);
+                        httpPatch(DB_URL + "/groups/" + chatId + ".json", meta.toString());
+                    }
+
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            loadMessages(chatId, isGroup, true);
+                        }
+                    });
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
+    private String httpGet(String urlStr) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(8000);
+        conn.setReadTimeout(8000);
+        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) sb.append(line);
+        br.close();
+        return sb.toString();
+    }
+
+    private void httpPut(String urlStr, String body) throws Exception {
+        sendJson(urlStr, "PUT", body);
+    }
+
+    private void httpPost(String urlStr, String body) throws Exception {
+        sendJson(urlStr, "POST", body);
+    }
+
+    private void httpPatch(String urlStr, String body) throws Exception {
+        sendJson(urlStr, "PATCH", body);
+    }
+
+    private void sendJson(String urlStr, String method, String body) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        conn.setDoOutput(true);
+        conn.setConnectTimeout(8000);
+        conn.setReadTimeout(8000);
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+        conn.getInputStream().close();
     }
 }
